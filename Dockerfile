@@ -19,10 +19,9 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # Copy EA files
-COPY ["test2.ex5", "/root/test2.ex5"]
-COPY ["test3.ex5", "/root/test3.ex5"]
-COPY ["test4.ex5", "/root/test4.ex5"]
 COPY ["test5.ex5", "/root/test5.ex5"]
+COPY ["test6.ex5", "/root/test6.ex5"]
+
 
 
 RUN cat > /entrypoint.sh <<EOF
@@ -61,10 +60,9 @@ fi
 
 mkdir -p "\$DATA_DIR/Experts"
 
-cp "/root/test2.ex5" "\$DATA_DIR/Experts/"
-cp "/root/test3.ex5" "\$DATA_DIR/Experts/"
-cp "/root/test4.ex5" "\$DATA_DIR/Experts/"
 cp "/root/test5.ex5" "\$DATA_DIR/Experts/"
+cp "/root/test6.ex5" "\$DATA_DIR/Experts/"
+
 
 
 
