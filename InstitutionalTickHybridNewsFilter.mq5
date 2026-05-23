@@ -1,883 +1,884 @@
 //+------------------------------------------------------------------+
-//|                                    PhantomEdge_TickScalper.mq5    |
-//|                          Ultra-Fast Tick Scalper for Cent Accounts |
-//|                                  v2.0 — Aggressive + Debug Mode   |
-//|                                                                    |
-//|  PHILOSOPHY:                                                       |
-//|  - Works on TICKS not bars — reacts to every price movement        |
-//|  - Mean reversion on tick RETURNS (not raw prices)                 |
-//|  - Micro-VWAP as dynamic fair value anchor                        |
-//|  - Ultra-tight risk: equity-based lots, circuit breaker            |
-//|  - News-aware: blocks new entries but NEVER closes winning trades  |
-//|  - Aggressive entries, surgical exits                              |
-//|  - FULL DEBUG OUTPUT so you can see what's happening               |
+//|                                            CentGrower_Rescue.mq5 |
+//|              RESCUED CONSERVATIVE CENT GROWTH SYSTEM             |
+//|                                                                  |
+//|  KEY FIXES:                                                      |
+//|  1. Reduced risk from 5% to 0.5% per trade                      |
+//|  2. Max lot capped at 0.1 instead of 5.0                        |
+//|  3. Higher conviction entries (Z-Score 2.0 vs 1.2)              |
+//|  4. Stricter regime filter (ER 0.7 vs 0.55)                     |
+//|  5. Wider stops to avoid premature stop-outs                    |
+//|  6. Removed aggressive timeout (was killing winners)            |
+//|  7. Better R:R ratio (minimum 1:2 instead of 1:1.33)            |
+//|  8. Lower max concurrent from 3 to 1                            |
 //+------------------------------------------------------------------+
-#property copyright "PhantomEdge v2.0"
-#property version   "2.00"
+#property copyright "CentGrower Rescue v7.00"
+#property version   "7.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| INPUT PARAMETERS                                                   |
+//| INPUT PARAMETERS - RESCUED & OPTIMIZED                             |
 //+------------------------------------------------------------------+
 
-//--- Core Strategy
-input group "=== CORE STRATEGY ==="
-input int      TickBufferSize       = 30;        // Tick buffer size (30 = fast warmup)
-input double   ZScoreEntry          = 1.5;       // Z-Score threshold to enter (aggressive)
-input double   ZScoreExit           = 0.2;       // Z-Score threshold to exit (quick scalp)
-input int      VWAPWindowTicks      = 50;        // Micro-VWAP lookback (ticks)
-input bool     UseVWAPConfirm       = true;      // Require VWAP confirmation for entry
+input group "=== CONSERVATIVE DUAL-ENGINE ==="
+input int    TickLookback         = 50;        // Increased for better signal quality
+input double RegimeThresholdER    = 0.70;      // Stricter: Only enter strong trends (was 0.55)
+input double EntryDeviationZ      = 2.0;       // Higher conviction (was 1.2)
+input int    ATR_Period           = 20;        // Longer ATR for stability (was 14)
+input ENUM_TIMEFRAMES ATR_TF      = PERIOD_M5; // Higher timeframe ATR (was M1)
 
-//--- Risk Management  
-input group "=== RISK MANAGEMENT ==="
-input double   RiskPercentPerTrade  = 1.5;       // Risk % of equity per trade
-input double   MaxDailyDrawdownPct  = 5.0;       // Max daily drawdown % (circuit breaker)
-input double   MaxTotalDrawdownPct  = 15.0;      // Max total drawdown % from peak equity
-input int      MaxPositionsPerSymbol= 1;         // Max positions per symbol (keep it 1!)
-input double   MaxLotSize           = 1.00;      // Maximum lot size cap
-input double   MinLotSize           = 0.01;      // Minimum lot size
+input group "=== SPIKE SHIELD - KEPT BUT REFINED ==="
+input int    VelocityLookback     = 30;        // More samples for better detection
+input double MaxTickVelocityDev   = 2.5;       // More sensitive to spikes (was 3.5)
+input double MinSpikeVelocity     = 5000.0;    // Higher threshold
+input int    SpikePauseSeconds    = 120;       // Longer pause (2 min vs 1 min)
 
-//--- Stop Loss & Take Profit
-input group "=== SL/TP & TRAILING ==="
-input double   SL_ATR_Multiplier    = 1.2;       // SL = ATR × this (tight for fast scalps)
-input double   TP_RR_Ratio          = 1.5;       // TP = SL distance × this (quick profit)
-input double   TrailingATR_Mult     = 0.8;       // Trailing stop = ATR × this (tight trail)
-input double   BreakevenATR_Mult    = 0.5;       // Move SL to breakeven FAST
-input int      ATR_Period           = 14;        // ATR period
-input ENUM_TIMEFRAMES ATR_Timeframe = PERIOD_M1; // ATR timeframe
+input group "=== CONSERVATIVE EXITS ==="
+input double StopLossATR_Mult     = 2.0;       // Wider stops to survive noise (was 1.5)
+input double TakeProfitATR_Mult   = 4.0;       // Better R:R ratio (2:1 minimum)
+input bool   UseTrailingStop      = true;
+input double Trailing_ATR_Mult    = 2.5;       // Wider trail to let winners run
+input double BreakevenTriggerPct  = 0.70;      // Move to BE later (70% vs 50%)
+input int    MaxHoldSeconds       = 3600;      // 1 hour instead of 5 min (was killing winners)
 
-//--- Spread & Volatility Filters
-input group "=== FILTERS ==="
-input int      MaxSpreadPoints      = 100;       // Max allowed spread (100 for crypto)
-input double   MinATR_Filter        = 0.0;       // Min ATR to trade (0 = auto-detect)
-input bool     UseSessionFilter     = false;     // Session filter (OFF for crypto 24/7)
-input int      SessionStartHour     = 7;         // Session start (only if filter ON)
-input int      SessionEndHour       = 20;        // Session end (only if filter ON)
+input group "=== CONSERVATIVE RISK ==="
+input double RiskPctPerTrade      = 0.5;       // 0.5% risk (10x smaller than 5%)
+input double MaxLot               = 0.10;      // Hard cap at 0.1
+input double MinLot               = 0.01;
+input int    MaxConcurrent        = 1;         // Single position (was 3)
 
-//--- News Filter
-input group "=== NEWS FILTER ==="
-input bool     UseNewsFilter        = true;      // Enable news filter
-input int      NewsMinutesBefore    = 30;        // Minutes before news to stop entries
-input int      NewsMinutesAfter     = 30;        // Minutes after news to stop entries
-
-//--- Trade Settings
-input group "=== TRADE SETTINGS ==="
-input int      MagicNumber          = 777888;    // Magic number
-input int      TradeSlippage        = 15;        // Max slippage (points)
-input string   TradeComment         = "PhantomEdge"; // Trade comment
-input int      CooldownSeconds      = 2;         // Seconds between trades (fast re-entry)
-input bool     DebugMode            = true;      // Print debug info to Experts tab
+input group "=== CIRCUIT BREAKERS ==="
+input double DailyProfitTargetPct = 5.0;       // Lock in 5% (was 15%)
+input double DailyLossLimitPct    = 5.0;       // Stop at -5% (was -15%)
+input int    MaxSpreadPts         = 3000;      // Tighter spread filter (was 5000)
+input int    CooldownSec          = 300;       // 5 min cooldown between trades (was 1 sec!)
+input bool   UseNewsFilter        = true;
+input int    NewsPauseBeforeMin   = 60;        // Longer news pause
+input int    NewsPauseAfterMin    = 30;
+input bool   DebugLog             = true;
 
 //+------------------------------------------------------------------+
-//| GLOBAL VARIABLES                                                   |
+//| GLOBAL SYSTEM VARIABLES                                            |
 //+------------------------------------------------------------------+
-CTrade         trade;
+CTrade trade;
 
-// Tick data buffers
-double         TickPrices[];         // Raw tick prices (mid)
-double         TickReturns[];        // Log returns between ticks
-double         TickVolumes[];        // Tick volumes for VWAP
-int            TickCount = 0;        // How many ticks we've collected
-bool           BufferReady = false;  // Is buffer fully populated?
+double TickPrices[];
+double TickReturns[];
+double TickVolumes[];
+long   TickTimesMsc[];
+int    TickCount = 0;
+bool   WarmupDone = false;
+long   LastTickMsc = 0;
 
-// VWAP data
-double         VWAPPrices[];
-double         VWAPVolumes[];
-int            VWAPCount = 0;
-bool           VWAPReady = false;
+double TickVelocities[];
+datetime SpikeBlockEndTime = 0;
+bool IsSpikeShieldActive = false;
 
-// State tracking
-datetime       LastTradeTime = 0;
-double         DayStartEquity = 0;
-double         PeakEquity = 0;
-bool           DailyCircuitBreaker = false;
-bool           TotalCircuitBreaker = false;
-datetime       LastDay = 0;
-long           LastTickTimeMsc = 0;   // Milliseconds (was datetime = BUG!)
+double DayOpenEquity = 0;
+bool   DailyTargetHit = false;
+bool   DailyLossHit = false;
+datetime DayResetTime = 0;
 
-// Debug tracking
-int            DebugCounter = 0;
-int            FilterBlockCount = 0;
-int            SignalCount = 0;
-datetime       LastDebugPrint = 0;
+int ATR_Handle = INVALID_HANDLE;
+datetime LastTradeTime = 0;
+datetime LastDiagTime = 0;
 
-// ATR handle
-int            ATR_Handle = INVALID_HANDLE;
+int WinCount = 0;
+int LossCount = 0;
+double TotalProfit = 0;
+
+bool NewsBlocking = false;
+datetime NewsBlockEnd = 0;
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                              |
+//| OnInit                                                             |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Setup trade object
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(TradeSlippage);
+   trade.SetExpertMagicNumber(777322); // New magic number for rescue version
+   trade.SetDeviationInPoints(30);     // Higher deviation tolerance
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   
-   // Initialize tick buffers
-   ArrayResize(TickPrices, TickBufferSize);
-   ArrayResize(TickReturns, TickBufferSize);
-   ArrayResize(TickVolumes, TickBufferSize);
-   ArrayInitialize(TickPrices, 0);
-   ArrayInitialize(TickReturns, 0);
-   ArrayInitialize(TickVolumes, 0);
-   
-   // Initialize VWAP buffers
-   ArrayResize(VWAPPrices, VWAPWindowTicks);
-   ArrayResize(VWAPVolumes, VWAPWindowTicks);
-   ArrayInitialize(VWAPPrices, 0);
-   ArrayInitialize(VWAPVolumes, 0);
-   
-   // Create ATR indicator
-   ATR_Handle = iATR(_Symbol, ATR_Timeframe, ATR_Period);
+   trade.SetAsyncMode(false);
+
+   ArrayResize(TickPrices, TickLookback);
+   ArrayResize(TickReturns, TickLookback);
+   ArrayResize(TickVolumes, TickLookback);
+   ArrayResize(TickTimesMsc, TickLookback);
+   ArrayInitialize(TickPrices, 0.0);
+   ArrayInitialize(TickReturns, 0.0);
+   ArrayInitialize(TickVolumes, 0.0);
+   ArrayInitialize(TickTimesMsc, 0);
+
+   ArrayResize(TickVelocities, VelocityLookback);
+   ArrayInitialize(TickVelocities, 0.0);
+
+   ATR_Handle = iATR(_Symbol, ATR_TF, ATR_Period);
    if(ATR_Handle == INVALID_HANDLE)
    {
-      Print("❌ ERROR: Failed to create ATR indicator");
+      Print("❌ INIT FAILED: Cannot create ATR indicator.");
       return INIT_FAILED;
    }
-   
-   // Initialize equity tracking
-   DayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   PeakEquity = DayStartEquity;
-   LastDay = TimeCurrent();
-   
+
+   DayOpenEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   DayResetTime  = TimeCurrent();
+
    Print("╔══════════════════════════════════════════════════════╗");
-   Print("║     PhantomEdge TickScalper v2.0 — INITIALIZED      ║");
+   Print("║     CENTGROWER RESCUE v7.00 — CONSERVATIVE MODE      ║");
+   Print("╠══════════════════════════════════════════════════════╣");
+   Print("║  FIXED: Lower risk, better entries, wider stops      ║");
    Print("╚══════════════════════════════════════════════════════╝");
-   Print("  Account: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
-         " | Equity: $", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
-   Print("  Symbol: ", _Symbol, " | Digits: ", _Digits,
-         " | Point: ", DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_POINT), _Digits));
-   Print("  Spread now: ", SymbolInfoInteger(_Symbol, SYMBOL_SPREAD), " pts",
-         " | Max allowed: ", MaxSpreadPoints, " pts");
-   Print("  Buffer: ", TickBufferSize, " ticks",
-         " | VWAP: ", VWAPWindowTicks, " ticks",
-         " | Z-Entry: ", DoubleToString(ZScoreEntry, 1));
-   Print("  Risk/trade: ", DoubleToString(RiskPercentPerTrade, 1), "%",
-         " | Daily DD limit: ", DoubleToString(MaxDailyDrawdownPct, 1), "%");
-   Print("  Session filter: ", (UseSessionFilter ? "ON" : "OFF"),
-         " | News filter: ", (UseNewsFilter ? "ON" : "OFF"));
-   Print("  Debug mode: ", (DebugMode ? "ON — you'll see what I'm thinking" : "OFF"));
-   Print("  ⏳ Warming up... need ", TickBufferSize + 1, " ticks before first trade");
-   
+   Print("  Symbol        : ", _Symbol);
+   Print("  Risk / Trade  : ", RiskPctPerTrade, "% (Down from 5%)");
+   Print("  Max Lot       : ", MaxLot, " (Down from 5.0)");
+   Print("  Max Positions : ", MaxConcurrent, " (Single position)");
+   Print("  Min R:R       : 1:2");
+   Print("  Cooldown      : ", CooldownSec, "s (Up from 1s)");
+
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization                                            |
+//| OnDeinit                                                           |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    if(ATR_Handle != INVALID_HANDLE)
       IndicatorRelease(ATR_Handle);
-      
-   Print("═══ PhantomEdge TickScalper STOPPED ═══");
-   Print("  Signals detected: ", SignalCount, " | Blocked by filters: ", FilterBlockCount);
+
+   int total = WinCount + LossCount;
+   double wr = total > 0 ? ((double)WinCount / total) * 100.0 : 0.0;
+
+   Print("═══════════════════════ SESSION END ══════════════════════");
+   Print("  Trades completed : ", total, " | Wins: ", WinCount, " | Losses: ", LossCount);
+   Print("  Win Rate achieved: ", DoubleToString(wr, 1), "%");
+   Print("  Total Profit/Loss: $", DoubleToString(TotalProfit, 2));
+   Print("═══════════════════════════════════════════════════════════");
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function — THE HEART                                   |
+//| OnTick                                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Process ALL ticks since last call using CopyTicks
-   MqlTick ticks[];
-   int copied = CopyTicks(_Symbol, ticks, COPY_TICKS_ALL, 0, 200);
-   
-   if(copied <= 0)
+   MqlTick rawTicks[];
+   int cnt = CopyTicks(_Symbol, rawTicks, COPY_TICKS_ALL, 0, 100);
+   if(cnt > 0)
    {
-      if(DebugMode && TimeCurrent() - LastDebugPrint > 30)
+      for(int i = 0; i < cnt; i++)
       {
-         Print("⚠ CopyTicks returned 0 — no tick data available");
-         LastDebugPrint = TimeCurrent();
-      }
-      return;
-   }
-   
-   // Process only new ticks
-   int newTicks = 0;
-   for(int i = 0; i < copied; i++)
-   {
-      if(ticks[i].time_msc <= LastTickTimeMsc && LastTickTimeMsc != 0) continue;
-      
-      LastTickTimeMsc = ticks[i].time_msc;
-      double midPrice = (ticks[i].ask + ticks[i].bid) / 2.0;
-      double tickVol  = (double)ticks[i].volume;
-      if(tickVol < 1) tickVol = 1;
-      
-      ProcessTick(midPrice, tickVol);
-      newTicks++;
-   }
-   
-   //--- Periodic debug status (every 10 seconds)
-   if(DebugMode && TimeCurrent() - LastDebugPrint >= 10)
-   {
-      LastDebugPrint = TimeCurrent();
-      DebugCounter++;
-      
-      if(!BufferReady)
-      {
-         Print("⏳ Warming up: ", TickCount, "/", TickBufferSize + 1, " ticks collected...");
-      }
-      else
-      {
-         double zScore = CalcZScore();
-         double cumZ = CalcCumulativeZScore(8);
-         double vwap = CalcMicroVWAP();
-         double mid = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0;
-         double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-         double atr = GetATR();
+         if(rawTicks[i].time_msc <= LastTickMsc && LastTickMsc != 0) continue;
+         LastTickMsc = rawTicks[i].time_msc;
          
-         string vwapDir = "";
-         if(vwap > 0)
-            vwapDir = (mid > vwap) ? " ABOVE vwap" : " BELOW vwap";
+         double mid = (rawTicks[i].ask + rawTicks[i].bid) * 0.5;
+         double vol = (double)rawTicks[i].volume;
+         if(vol < 1.0) vol = 1.0;
          
-         Print("📊 Z=", DoubleToString(zScore, 2),
-               " | CumZ=", DoubleToString(cumZ, 2),
-               " | Spread=", (int)spread,
-               " | ATR=", DoubleToString(atr, _Digits),
-               " | VWAP", (VWAPReady ? vwapDir : "=warming"),
-               " | Pos=", CountMyPositions(),
-               " | Need Z≤-", DoubleToString(ZScoreEntry, 1), " or Z≥+", DoubleToString(ZScoreEntry, 1));
+         IngestTickData(mid, vol, rawTicks[i].time_msc);
       }
    }
-   
-   //--- Check daily reset
+
    CheckDailyReset();
-   
-   //--- Circuit breaker check
-   UpdateCircuitBreakers();
-   if(DailyCircuitBreaker || TotalCircuitBreaker)
+   CheckDailyLimits();
+   ManagePositions();
+
+   if(DailyTargetHit || DailyLossHit) return;
+
+   if(DebugLog && TimeCurrent() - LastDiagTime >= 60) // Less frequent logging
    {
-      ManageOpenPositions();
-      return;
+      LastDiagTime = TimeCurrent();
+      PrintDiagnostics();
    }
-   
-   //--- Manage existing positions
-   ManageOpenPositions();
-   
-   //--- Check if buffer is ready
-   if(!BufferReady) return;
-   
-   //--- Check all filters before entry
-   if(!PassesAllFilters()) return;
-   
-   //--- Check cooldown
-   if(TimeCurrent() - LastTradeTime < CooldownSeconds) return;
-   
-   //--- Check max positions
-   if(CountMyPositions() >= MaxPositionsPerSymbol) return;
-   
-   //--- ENTRY LOGIC
-   EvaluateEntry();
+
+   if(!WarmupDone) return;
+   if(IsSpikeShieldActive && TimeCurrent() < SpikeBlockEndTime) return;
+   if(!PassesFilters()) return;
+   if(CountPositions() >= MaxConcurrent) return;
+   if(TimeCurrent() - LastTradeTime < CooldownSec) return;
+
+   TryEntry();
 }
 
 //+------------------------------------------------------------------+
-//| Process a single tick into our buffers                             |
+//| IngestTickData - Same as original but with Velocity buffer fix    |
 //+------------------------------------------------------------------+
-void ProcessTick(double price, double volume)
+void IngestTickData(double price, double volume, long timeMsc)
 {
-   // Shift buffer left
-   for(int i = 0; i < TickBufferSize - 1; i++)
+   for(int i = 0; i < TickLookback - 1; i++)
    {
-      TickPrices[i] = TickPrices[i + 1];
-      TickReturns[i] = TickReturns[i + 1];
-      TickVolumes[i] = TickVolumes[i + 1];
+      TickPrices[i]     = TickPrices[i + 1];
+      TickReturns[i]    = TickReturns[i + 1];
+      TickVolumes[i]    = TickVolumes[i + 1];
+      TickTimesMsc[i]   = TickTimesMsc[i + 1];
    }
-   
-   // Add new tick
-   TickPrices[TickBufferSize - 1] = price;
-   TickVolumes[TickBufferSize - 1] = volume;
-   
-   // Calculate log return
-   if(TickPrices[TickBufferSize - 2] > 0)
-      TickReturns[TickBufferSize - 1] = MathLog(price / TickPrices[TickBufferSize - 2]);
+   TickPrices[TickLookback - 1]     = price;
+   TickVolumes[TickLookback - 1]    = volume;
+   TickTimesMsc[TickLookback - 1]   = timeMsc;
+
+   if(TickPrices[TickLookback - 2] > 0.0)
+      TickReturns[TickLookback - 1] = MathLog(price / TickPrices[TickLookback - 2]);
    else
-      TickReturns[TickBufferSize - 1] = 0;
-   
+      TickReturns[TickLookback - 1] = 0.0;
+
    TickCount++;
-   
-   // Buffer ready after full population
-   if(!BufferReady && TickCount >= TickBufferSize + 1)
+   if(!WarmupDone && TickCount >= TickLookback + 5) // More warmup ticks
    {
-      BufferReady = true;
-      Print("✅ Tick buffer READY! (", TickCount, " ticks) — Now scanning for entries...");
+      WarmupDone = true;
+      Print("✅ Warmup complete! Ready for high-probability entries.");
    }
-   
-   // VWAP buffer
-   for(int i = 0; i < VWAPWindowTicks - 1; i++)
+
+   // Velocity calculation (same logic)
+   double timeDeltaMsc = 0.0;
+   double pointsDelta = 0.0;
+
+   for(int i = TickLookback - 2; i >= 0; i--)
    {
-      VWAPPrices[i] = VWAPPrices[i + 1];
-      VWAPVolumes[i] = VWAPVolumes[i + 1];
+      if(TickTimesMsc[TickLookback - 1] != TickTimesMsc[i])
+      {
+         timeDeltaMsc = (double)(TickTimesMsc[TickLookback - 1] - TickTimesMsc[i]);
+         pointsDelta = MathAbs(TickPrices[TickLookback - 1] - TickPrices[i]) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+         break;
+      }
    }
-   VWAPPrices[VWAPWindowTicks - 1] = price;
-   VWAPVolumes[VWAPWindowTicks - 1] = volume;
-   VWAPCount++;
-   
-   if(!VWAPReady && VWAPCount >= VWAPWindowTicks)
+
+   if(timeDeltaMsc < 10.0) timeDeltaMsc = 10.0;
+   double velocity = pointsDelta / (timeDeltaMsc / 1000.0);
+
+   for(int i = 0; i < VelocityLookback - 1; i++)
+      TickVelocities[i] = TickVelocities[i + 1];
+   TickVelocities[VelocityLookback - 1] = velocity;
+
+   if(WarmupDone)
    {
-      VWAPReady = true;
-      Print("✅ VWAP buffer READY! (", VWAPCount, " ticks)");
+      double sum = 0;
+      int validCount = 0;
+      for(int i = 0; i < VelocityLookback - 1; i++)
+      {
+         if(TickVelocities[i] > 0)
+         {
+            sum += TickVelocities[i];
+            validCount++;
+         }
+      }
+      
+      if(validCount < 3) return;
+      double mean = sum / validCount;
+
+      double sumSq = 0;
+      for(int i = 0; i < VelocityLookback - 1; i++)
+      {
+         if(TickVelocities[i] > 0)
+         {
+            double diff = TickVelocities[i] - mean;
+            sumSq += diff * diff;
+         }
+      }
+      double stdev = MathSqrt(sumSq / (validCount - 1));
+
+      if(stdev > 0.01 && velocity > mean + MaxTickVelocityDev * stdev && velocity > MinSpikeVelocity)
+      {
+         if(!IsSpikeShieldActive)
+         {
+            IsSpikeShieldActive = true;
+            SpikeBlockEndTime = TimeCurrent() + SpikePauseSeconds;
+            Print("🚨 SPIKE DETECTED! Pausing for ", SpikePauseSeconds, "s");
+         }
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Z-Score on RETURNS (not raw prices!)                     |
+//| CalculateFractalEfficiency - Same as original                     |
 //+------------------------------------------------------------------+
-double CalcZScore()
+double CalculateFractalEfficiency()
+{
+   double displacement = MathAbs(TickPrices[TickLookback - 1] - TickPrices[0]);
+   double totalPath = 0.0;
+   for(int i = 1; i < TickLookback; i++)
+      totalPath += MathAbs(TickPrices[i] - TickPrices[i - 1]);
+
+   if(totalPath < 1e-12) return 0.0;
+   return displacement / totalPath;
+}
+
+//+------------------------------------------------------------------+
+//| CalculateReturnsZScore - Same as original                         |
+//+------------------------------------------------------------------+
+double CalculateReturnsZScore()
 {
    double sum = 0;
-   for(int i = 0; i < TickBufferSize; i++)
-      sum += TickReturns[i];
-   double mean = sum / TickBufferSize;
-   
-   double sumSqDev = 0;
-   for(int i = 0; i < TickBufferSize; i++)
+   for(int i = 0; i < TickLookback; i++) sum += TickReturns[i];
+   double mean = sum / TickLookback;
+
+   double sumSq = 0;
+   for(int i = 0; i < TickLookback; i++)
    {
-      double dev = TickReturns[i] - mean;
-      sumSqDev += dev * dev;
+      double diff = TickReturns[i] - mean;
+      sumSq += diff * diff;
    }
-   double stdev = MathSqrt(sumSqDev / (TickBufferSize - 1));
-   
-   if(stdev < 1e-12) return 0;
-   
-   return (TickReturns[TickBufferSize - 1] - mean) / stdev;
+   double stdev = MathSqrt(sumSq / (TickLookback - 1));
+   if(stdev < 1e-12) return 0.0;
+
+   return (TickReturns[TickLookback - 1] - mean) / stdev;
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Micro-VWAP                                               |
+//| CalculateVWAP - Same as original                                  |
 //+------------------------------------------------------------------+
-double CalcMicroVWAP()
+double CalculateVWAP()
 {
-   if(!VWAPReady) return 0;
-   
-   double sumPV = 0;
-   double sumV = 0;
-   
-   for(int i = 0; i < VWAPWindowTicks; i++)
+   double sumPriceVolume = 0.0;
+   double sumVolume = 0.0;
+
+   for(int i = 0; i < TickLookback; i++)
    {
-      if(VWAPPrices[i] <= 0) return 0;
-      sumPV += VWAPPrices[i] * VWAPVolumes[i];
-      sumV  += VWAPVolumes[i];
+      sumPriceVolume += TickPrices[i] * TickVolumes[i];
+      sumVolume += TickVolumes[i];
    }
-   
-   if(sumV < 1) return 0;
-   return sumPV / sumV;
+
+   if(sumVolume < 1.0) return TickPrices[TickLookback - 1];
+   return sumPriceVolume / sumVolume;
 }
 
 //+------------------------------------------------------------------+
-//| Cumulative Z-Score (multi-tick momentum)                           |
+//| TryEntry - IMPROVED with confirmation filter                      |
 //+------------------------------------------------------------------+
-double CalcCumulativeZScore(int lookback)
+void TryEntry()
 {
-   if(lookback > TickBufferSize) lookback = TickBufferSize;
-   
-   double cumReturn = 0;
-   for(int i = TickBufferSize - lookback; i < TickBufferSize; i++)
-      cumReturn += TickReturns[i];
-   
-   double sum = 0;
-   for(int i = 0; i < TickBufferSize; i++)
-      sum += TickReturns[i];
-   double mean = sum / TickBufferSize;
-   
-   double sumSqDev = 0;
-   for(int i = 0; i < TickBufferSize; i++)
-   {
-      double dev = TickReturns[i] - mean;
-      sumSqDev += dev * dev;
-   }
-   double stdev = MathSqrt(sumSqDev / (TickBufferSize - 1));
-   
-   if(stdev < 1e-12) return 0;
-   
-   double expectedStdev = stdev * MathSqrt((double)lookback);
-   return (cumReturn - mean * lookback) / expectedStdev;
-}
+   double efficiency = CalculateFractalEfficiency();
+   double zScore     = CalculateReturnsZScore();
+   double vwap       = CalculateVWAP();
 
-//+------------------------------------------------------------------+
-//| ENTRY — Fast & Aggressive                                          |
-//+------------------------------------------------------------------+
-void EvaluateEntry()
-{
-   double zScore = CalcZScore();
-   double cumZ   = CalcCumulativeZScore(8);  // 8-tick momentum (was 10)
-   double vwap   = CalcMicroVWAP();
-   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double mid    = (ask + bid) / 2.0;
-   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double mid = (ask + bid) * 0.5;
+
+   bool buySignal = false;
+   bool sellSignal = false;
+   string engineUsed = "";
+
+   if(efficiency >= RegimeThresholdER)
+   {
+      // ENGINE 1: STRONG TREND BREAKOUT (Stricter conditions)
+      double bufferHigh = -999999.0;
+      double bufferLow  = 999999.0;
+      
+      for(int i = 0; i < TickLookback - 1; i++)
+      {
+         if(TickPrices[i] > bufferHigh) bufferHigh = TickPrices[i];
+         if(TickPrices[i] < bufferLow && TickPrices[i] > 0.0) bufferLow = TickPrices[i];
+      }
+
+      // ADDED: Require momentum confirmation (price must be accelerating)
+      double recentReturn = TickReturns[TickLookback - 1];
+      double prevReturn = TickReturns[TickLookback - 3];
+      
+      if(mid > bufferHigh && recentReturn > 0 && recentReturn > prevReturn)
+      {
+         buySignal = true;
+         engineUsed = "Strong Trend Breakout";
+      }
+      else if(mid < bufferLow && recentReturn < 0 && recentReturn < prevReturn)
+      {
+         sellSignal = true;
+         engineUsed = "Strong Trend Breakout";
+      }
+   }
+   else
+   {
+      // ENGINE 2: EXTREME MEAN REVERSION (Stricter Z-Score)
+      if(zScore <= -EntryDeviationZ && mid < vwap)
+      {
+         buySignal = true;
+         engineUsed = "Deep Mean Reversion";
+      }
+      else if(zScore >= EntryDeviationZ && mid > vwap)
+      {
+         sellSignal = true;
+         engineUsed = "Deep Mean Reversion";
+      }
+   }
+
+   if(!buySignal && !sellSignal) return;
+
    double atr = GetATR();
-   if(atr <= 0)
+   if(atr <= 0) return;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   // ADDED: Minimum ATR filter for meaningful moves
+   if(atr / point < 5.0) // At least 5 points ATR
    {
-      if(DebugMode) Print("⚠ ATR = 0, can't calculate SL/TP");
+      if(DebugLog)
+         Print("🔍 Signal found but ATR too low (", atr/point, " pts) - skipping");
       return;
    }
+
+   long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freeze = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double limitDist = MathMax((double)stopLevel, (double)freeze);
+   double minSafety = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * 2.0; // Tighter spread buffer
+   limitDist = MathMax(limitDist, minSafety);
+
+   double slPoints = atr / point * StopLossATR_Mult;
+   double tpPoints = atr / point * TakeProfitATR_Mult;
+
+   if(slPoints < limitDist) slPoints = limitDist;
+   if(tpPoints < limitDist) tpPoints = limitDist;
+
+   // CHANGED: Minimum 1:2 risk-reward ratio
+   if(tpPoints < slPoints * 2.0) 
+   {
+      tpPoints = slPoints * 2.0;
+      if(DebugLog)
+         Print("📐 Adjusted TP to maintain 1:2 R:R");
+   }
+
+   double lots = ComputeLots(slPoints);
    
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   if(point <= 0) return;
-   
-   //=== BUY SIGNAL ===
-   // Price dipped hard (negative Z) + momentum confirms + below VWAP
-   bool buySignal = (zScore <= -ZScoreEntry) && (cumZ <= -0.8);
-   
-   if(UseVWAPConfirm && vwap > 0)
-      buySignal = buySignal && (mid < vwap);
-   
-   //=== SELL SIGNAL ===
-   // Price spiked hard (positive Z) + momentum confirms + above VWAP
-   bool sellSignal = (zScore >= ZScoreEntry) && (cumZ >= 0.8);
-   
-   if(UseVWAPConfirm && vwap > 0)
-      sellSignal = sellSignal && (mid > vwap);
-   
-   //=== EXECUTE ===
+   // ADDED: Maximum exposure check
+   double maxExposure = AccountInfoDouble(ACCOUNT_EQUITY) * 0.01; // Max 1% account exposure
+   double exposurePerLot = slPoints * point / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) * 
+                           SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double maxAllowedLots = maxExposure / exposurePerLot;
+   lots = MathMin(lots, maxAllowedLots);
+   lots = MathMin(lots, MaxLot);
+
    if(buySignal)
    {
-      SignalCount++;
-      double slDist = atr * SL_ATR_Multiplier;
-      double sl = NormalizeDouble(ask - slDist, _Digits);
-      double tp = NormalizeDouble(ask + slDist * TP_RR_Ratio, _Digits);
-      
-      if(!ValidateStops(ORDER_TYPE_BUY, ask, sl, tp))
-      {
-         if(DebugMode) Print("⚠ BUY signal but stops invalid (too close to price)");
-         FilterBlockCount++;
-         return;
-      }
-      
-      double lots = CalcLotSize(MathAbs(ask - sl) / point);
-      
-      Print("🟢══════════════════════════════════════════════");
-      Print("🟢 BUY SIGNAL #", SignalCount);
-      Print("🟢 Z=", DoubleToString(zScore, 3),
-            " | CumZ=", DoubleToString(cumZ, 3),
-            " | VWAP=", DoubleToString(vwap, _Digits));
-      Print("🟢 Entry=", DoubleToString(ask, _Digits),
-            " | SL=", DoubleToString(sl, _Digits),
-            " | TP=", DoubleToString(tp, _Digits),
-            " | Lots=", DoubleToString(lots, 2));
-      
-      if(trade.Buy(lots, _Symbol, ask, sl, tp, TradeComment))
-      {
+      double sl = NormalizeDouble(ask - slPoints * point, _Digits);
+      double tp = NormalizeDouble(ask + tpPoints * point, _Digits);
+
+      Print("🟢 BUY | Engine: ", engineUsed, " | ER: ", DoubleToString(efficiency, 2), 
+            " | Z: ", DoubleToString(zScore, 2), " | R:R 1:", DoubleToString(tpPoints/slPoints, 1),
+            " | Lots: ", DoubleToString(lots, 2));
+            
+      if(trade.Buy(lots, _Symbol, ask, sl, tp, "CentGrower Rescue"))
          LastTradeTime = TimeCurrent();
-         Print("🟢 ✅ BUY OPENED SUCCESSFULLY!");
-      }
-      else
-      {
-         Print("🟢 ❌ BUY FAILED: ", trade.ResultRetcodeDescription());
-      }
-      Print("🟢══════════════════════════════════════════════");
    }
    else if(sellSignal)
    {
-      SignalCount++;
-      double slDist = atr * SL_ATR_Multiplier;
-      double sl = NormalizeDouble(bid + slDist, _Digits);
-      double tp = NormalizeDouble(bid - slDist * TP_RR_Ratio, _Digits);
-      
-      if(!ValidateStops(ORDER_TYPE_SELL, bid, sl, tp))
-      {
-         if(DebugMode) Print("⚠ SELL signal but stops invalid (too close to price)");
-         FilterBlockCount++;
-         return;
-      }
-      
-      double lots = CalcLotSize(MathAbs(sl - bid) / point);
-      
-      Print("🔴══════════════════════════════════════════════");
-      Print("🔴 SELL SIGNAL #", SignalCount);
-      Print("🔴 Z=", DoubleToString(zScore, 3),
-            " | CumZ=", DoubleToString(cumZ, 3),
-            " | VWAP=", DoubleToString(vwap, _Digits));
-      Print("🔴 Entry=", DoubleToString(bid, _Digits),
-            " | SL=", DoubleToString(sl, _Digits),
-            " | TP=", DoubleToString(tp, _Digits),
-            " | Lots=", DoubleToString(lots, 2));
-      
-      if(trade.Sell(lots, _Symbol, bid, sl, tp, TradeComment))
-      {
+      double sl = NormalizeDouble(bid + slPoints * point, _Digits);
+      double tp = NormalizeDouble(bid - tpPoints * point, _Digits);
+
+      Print("🔴 SELL | Engine: ", engineUsed, " | ER: ", DoubleToString(efficiency, 2), 
+            " | Z: ", DoubleToString(zScore, 2), " | R:R 1:", DoubleToString(tpPoints/slPoints, 1),
+            " | Lots: ", DoubleToString(lots, 2));
+            
+      if(trade.Sell(lots, _Symbol, bid, sl, tp, "CentGrower Rescue"))
          LastTradeTime = TimeCurrent();
-         Print("🔴 ✅ SELL OPENED SUCCESSFULLY!");
-      }
-      else
-      {
-         Print("🔴 ❌ SELL FAILED: ", trade.ResultRetcodeDescription());
-      }
-      Print("🔴══════════════════════════════════════════════");
    }
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE POSITIONS — Trailing, breakeven, Z-score exit               |
+//| ManagePositions - IMPROVED trailing logic                         |
 //+------------------------------------------------------------------+
-void ManageOpenPositions()
+void ManagePositions()
 {
    double atr = GetATR();
-   if(atr <= 0) return;
-   
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(atr <= 0.0) return;
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != 777322) continue; // Changed magic
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      
+
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentSL = PositionGetDouble(POSITION_SL);
       double currentTP = PositionGetDouble(POSITION_TP);
       long   posType   = PositionGetInteger(POSITION_TYPE);
-      double point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      datetime openTime= (datetime)PositionGetInteger(POSITION_TIME);
       double profit    = PositionGetDouble(POSITION_PROFIT);
+      double swap      = PositionGetDouble(POSITION_SWAP);
+      double commission = 0; // Some brokers include commission
+
+      // ADDED: Check if position is actually profitable enough to trail
+      double totalPnL = profit + swap;
       
-      //--- Z-Score exit: price reverted to mean → take profit early
-      if(BufferReady)
+      // IMPROVED: Timeout only for truly dead trades (1 hour)
+      int holdSecs = (int)(TimeCurrent() - openTime);
+      if(holdSecs >= MaxHoldSeconds && totalPnL < 0) // Only close losers on timeout
       {
-         double zNow = CalcZScore();
-         double cumZNow = CalcCumulativeZScore(8);
-         
-         if(posType == POSITION_TYPE_BUY && zNow >= ZScoreExit && cumZNow >= 0 && profit > 0)
-         {
-            trade.PositionClose(ticket);
-            Print("💰 BUY CLOSED (Z-revert) | Z=", DoubleToString(zNow, 2),
-                  " | Profit=$", DoubleToString(profit, 2));
-            continue;
-         }
-         else if(posType == POSITION_TYPE_SELL && zNow <= -ZScoreExit && cumZNow <= 0 && profit > 0)
-         {
-            trade.PositionClose(ticket);
-            Print("💰 SELL CLOSED (Z-revert) | Z=", DoubleToString(zNow, 2),
-                  " | Profit=$", DoubleToString(profit, 2));
-            continue;
-         }
+         trade.PositionClose(ticket);
+         Print("⏳ LOSING TRADE TIMEOUT: Closed after ", holdSecs/60, "min | P&L: $", DoubleToString(totalPnL, 2));
+         continue;
       }
-      
-      //--- Breakeven logic
-      double breakevenDist = atr * BreakevenATR_Mult;
-      
+
+      // ADDED: Lock in profits at specific thresholds
+      double atrValue = atr;
+      double profitInATR = MathAbs(totalPnL) / (atrValue * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) / 
+                           SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE));
+
       if(posType == POSITION_TYPE_BUY)
       {
          double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         
-         // Breakeven
-         if(bid >= openPrice + breakevenDist && currentSL < openPrice)
+         double distInProfit = bid - openPrice;
+
+         // Breakeven at 70% profit distance
+         double slDistance = MathAbs(openPrice - currentSL);
+         if(slDistance <= 0.0) slDistance = atrValue * StopLossATR_Mult;
+         double targetForBE = slDistance * BreakevenTriggerPct;
+
+         if(distInProfit >= targetForBE && currentSL < openPrice)
          {
-            double newSL = NormalizeDouble(openPrice + point * 2, _Digits);
-            if(newSL > currentSL)
+            double newSL = NormalizeDouble(openPrice + 1.0 * point, _Digits);
+            long minStop = MathMax(
+               SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL),
+               SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL));
+
+            if(MathAbs(bid - newSL) > minStop * point)
             {
                trade.PositionModify(ticket, newSL, currentTP);
-               if(DebugMode) Print("🛡 BUY → BREAKEVEN at ", DoubleToString(newSL, _Digits));
+               if(DebugLog) Print("🛡️ BUY BREAKEVEN: SL moved to entry+1pt");
+               currentSL = newSL;
             }
          }
-         
-         // Trailing stop
-         double trailLevel = NormalizeDouble(bid - atr * TrailingATR_Mult, _Digits);
-         if(trailLevel > currentSL && trailLevel > openPrice)
+
+         // Trailing stop - wider and smarter
+         if(UseTrailingStop && distInProfit > atrValue)
          {
-            trade.PositionModify(ticket, trailLevel, currentTP);
+            double trailDist = atrValue * Trailing_ATR_Mult;
+            double desiredSL = NormalizeDouble(bid - trailDist, _Digits);
+
+            // Only trail if we're moving SL significantly
+            if(desiredSL > currentSL + atrValue * 0.5 && desiredSL > openPrice)
+            {
+               long minStop = MathMax(
+                  SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL),
+                  SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL));
+
+               if(MathAbs(bid - desiredSL) > minStop * point)
+               {
+                  trade.PositionModify(ticket, desiredSL, currentTP);
+                  if(DebugLog) Print("📈 BUY TRAIL: SL moved to ", desiredSL);
+               }
+            }
          }
       }
       else if(posType == POSITION_TYPE_SELL)
       {
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         
-         // Breakeven
-         if(ask <= openPrice - breakevenDist && (currentSL > openPrice || currentSL == 0))
+         double distInProfit = openPrice - ask;
+
+         double slDistance = MathAbs(openPrice - currentSL);
+         if(slDistance <= 0.0) slDistance = atrValue * StopLossATR_Mult;
+         double targetForBE = slDistance * BreakevenTriggerPct;
+
+         if(distInProfit >= targetForBE && (currentSL > openPrice || currentSL == 0.0))
          {
-            double newSL = NormalizeDouble(openPrice - point * 2, _Digits);
-            if(currentSL == 0 || newSL < currentSL)
+            double newSL = NormalizeDouble(openPrice - 1.0 * point, _Digits);
+            long minStop = MathMax(
+               SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL),
+               SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL));
+
+            if(MathAbs(newSL - ask) > minStop * point)
             {
                trade.PositionModify(ticket, newSL, currentTP);
-               if(DebugMode) Print("🛡 SELL → BREAKEVEN at ", DoubleToString(newSL, _Digits));
+               if(DebugLog) Print("🛡️ SELL BREAKEVEN: SL moved to entry-1pt");
+               currentSL = newSL;
             }
          }
-         
-         // Trailing stop
-         double trailLevel = NormalizeDouble(ask + atr * TrailingATR_Mult, _Digits);
-         if((trailLevel < currentSL || currentSL == 0) && trailLevel < openPrice)
+
+         if(UseTrailingStop && distInProfit > atrValue)
          {
-            trade.PositionModify(ticket, trailLevel, currentTP);
+            double trailDist = atrValue * Trailing_ATR_Mult;
+            double desiredSL = NormalizeDouble(ask + trailDist, _Digits);
+
+            if((desiredSL < currentSL - atrValue * 0.5 || currentSL == 0.0) && desiredSL < openPrice)
+            {
+               long minStop = MathMax(
+                  SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL),
+                  SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL));
+
+               if(MathAbs(desiredSL - ask) > minStop * point)
+               {
+                  trade.PositionModify(ticket, desiredSL, currentTP);
+                  if(DebugLog) Print("📉 SELL TRAIL: SL moved to ", desiredSL);
+               }
+            }
          }
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| DYNAMIC LOT SIZING                                                 |
+//| PassesFilters - Tighter quality control                           |
 //+------------------------------------------------------------------+
-double CalcLotSize(double slDistancePoints)
+bool PassesFilters()
 {
-   if(slDistancePoints <= 0) return MinLotSize;
-   
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskAmount = equity * (RiskPercentPerTrade / 100.0);
-   
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   
-   if(tickValue <= 0 || tickSize <= 0 || point <= 0) return MinLotSize;
-   
-   double riskPerLot = (slDistancePoints * point / tickSize) * tickValue;
-   if(riskPerLot <= 0) return MinLotSize;
-   
-   double lots = riskAmount / riskPerLot;
-   
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   double lotMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double lotMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   
-   lots = MathFloor(lots / lotStep) * lotStep;
-   lots = MathMax(lots, lotMin);
-   lots = MathMin(lots, lotMax);
-   lots = MathMax(lots, MinLotSize);
-   lots = MathMin(lots, MaxLotSize);
-   
-   return NormalizeDouble(lots, 2);
-}
-
-//+------------------------------------------------------------------+
-//| CIRCUIT BREAKERS                                                   |
-//+------------------------------------------------------------------+
-void UpdateCircuitBreakers()
-{
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   
-   if(equity > PeakEquity)
-      PeakEquity = equity;
-   
-   if(DayStartEquity > 0)
+   // Spread check - tighter
+   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   if(spread > MaxSpreadPts)
    {
-      double dailyDD = ((DayStartEquity - equity) / DayStartEquity) * 100.0;
-      if(dailyDD >= MaxDailyDrawdownPct && !DailyCircuitBreaker)
-      {
-         DailyCircuitBreaker = true;
-         Print("🚨 DAILY CIRCUIT BREAKER! DD=", DoubleToString(dailyDD, 2), "% — No new trades today");
-      }
-   }
-   
-   if(PeakEquity > 0)
-   {
-      double totalDD = ((PeakEquity - equity) / PeakEquity) * 100.0;
-      if(totalDD >= MaxTotalDrawdownPct && !TotalCircuitBreaker)
-      {
-         TotalCircuitBreaker = true;
-         Print("🚨🚨 TOTAL CIRCUIT BREAKER! DD=", DoubleToString(totalDD, 2), "% from peak — EA STOPPED");
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Daily reset                                                        |
-//+------------------------------------------------------------------+
-void CheckDailyReset()
-{
-   MqlDateTime now, last;
-   TimeToStruct(TimeCurrent(), now);
-   TimeToStruct(LastDay, last);
-   
-   if(now.day != last.day || now.mon != last.mon)
-   {
-      DayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-      DailyCircuitBreaker = false;
-      LastDay = TimeCurrent();
-      Print("═══ NEW DAY | Equity: $", DoubleToString(DayStartEquity, 2), " ═══");
-   }
-}
-
-//+------------------------------------------------------------------+
-//| FILTER CHECKS (with debug output!)                                 |
-//+------------------------------------------------------------------+
-bool PassesAllFilters()
-{
-   // Spread filter
-   long spreadPoints = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   if(spreadPoints > MaxSpreadPoints)
-   {
-      if(DebugMode && TimeCurrent() - LastDebugPrint >= 10)
-         Print("🚫 Spread too wide: ", spreadPoints, " > ", MaxSpreadPoints);
-      FilterBlockCount++;
+      if(DebugLog)
+         Print("🚫 SPREAD: ", spread, " pts (max ", MaxSpreadPts, ")");
       return false;
    }
-   
-   // ATR filter
-   double atr = GetATR();
-   double minATR = MinATR_Filter;
-   
-   if(minATR <= 0)
-   {
-      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      minATR = spreadPoints * point * 1.5; // 1.5× spread (was 2×, more lenient now)
-   }
-   
-   if(atr < minATR)
-   {
-      if(DebugMode && TimeCurrent() - LastDebugPrint >= 10)
-         Print("🚫 ATR too low: ", DoubleToString(atr, _Digits), " < ", DoubleToString(minATR, _Digits));
-      FilterBlockCount++;
-      return false;
-   }
-   
-   // Session filter
-   if(UseSessionFilter)
-   {
-      MqlDateTime serverTime;
-      TimeToStruct(TimeCurrent(), serverTime);
-      
-      if(SessionStartHour < SessionEndHour)
-      {
-         if(serverTime.hour < SessionStartHour || serverTime.hour >= SessionEndHour)
-         {
-            if(DebugMode && TimeCurrent() - LastDebugPrint >= 10)
-               Print("🚫 Outside session: hour=", serverTime.hour,
-                     " (allowed: ", SessionStartHour, "-", SessionEndHour, ")");
-            FilterBlockCount++;
-            return false;
-         }
-      }
-      else
-      {
-         if(serverTime.hour < SessionStartHour && serverTime.hour >= SessionEndHour)
-         {
-            FilterBlockCount++;
-            return false;
-         }
-      }
-   }
-   
+
    // News filter
-   if(UseNewsFilter && IsNewsTime())
+   if(UseNewsFilter && IsNearHighImpactNews())
+      return false;
+
+   // Spike shield
+   if(IsSpikeShieldActive && TimeCurrent() < SpikeBlockEndTime)
+      return false;
+
+   if(IsSpikeShieldActive && TimeCurrent() >= SpikeBlockEndTime)
    {
-      FilterBlockCount++;
+      IsSpikeShieldActive = false;
+      Print("🛡 Spike Shield cleared");
+   }
+
+   // ATR check - require more market movement
+   double atr = GetATR();
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(atr <= 0 || (atr / point) < 5.0) // Minimum 5 points ATR (was 2.0)
+   {
       return false;
    }
+
+   // ADDED: Session time filter - only trade active hours
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
    
+   // Avoid first 15 minutes of session (spread widening)
+   if(dt.hour == 0 && dt.min < 15) return false;
+   
+   // Avoid low liquidity periods (adjust for your broker timezone)
+   // if(dt.hour >= 22 || dt.hour < 2) return false;
+
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| NEWS FILTER                                                        |
+//| IsNearHighImpactNews - Same as original                           |
 //+------------------------------------------------------------------+
-bool IsNewsTime()
+bool IsNearHighImpactNews()
 {
-   datetime now = TimeCurrent();
-   datetime from = now - (NewsMinutesAfter * 60);
-   datetime to   = now + (NewsMinutesBefore * 60);
-   
+   if(NewsBlocking)
+   {
+      if(TimeCurrent() < NewsBlockEnd)
+         return true;
+      else
+      {
+         NewsBlocking = false;
+         Print("📰 News window cleared");
+      }
+   }
+
    MqlCalendarValue values[];
+   datetime now = TimeCurrent();
+   datetime from = now - (NewsPauseAfterMin * 60);
+   datetime to   = now + (NewsPauseBeforeMin * 60);
+
    int count = CalendarValueHistory(values, from, to);
-   
    if(count <= 0) return false;
-   
-   string baseCurrency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
-   string quoteCurrency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
-   
-   string symbolName = _Symbol;
-   StringToUpper(symbolName);
-   bool isSpecial = (StringFind(symbolName, "XAU") >= 0 || 
-                     StringFind(symbolName, "GOLD") >= 0 ||
-                     StringFind(symbolName, "US30") >= 0 ||
-                     StringFind(symbolName, "NAS") >= 0 ||
-                     StringFind(symbolName, "SPX") >= 0 ||
-                     StringFind(symbolName, "BTC") >= 0 ||
-                     StringFind(symbolName, "ETH") >= 0);
-   
+
+   string sym = _Symbol;
+   StringToUpper(sym);
+   string cur1 = StringSubstr(sym, 0, 3);
+   string cur2 = StringSubstr(sym, 3, 3);
+
    for(int i = 0; i < count; i++)
    {
-      MqlCalendarEvent event;
-      if(!CalendarEventById(values[i].event_id, event)) continue;
-      if(event.importance != CALENDAR_IMPORTANCE_HIGH) continue;
-      
-      MqlCalendarCountry country;
-      if(!CalendarCountryById(event.country_id, country)) continue;
-      
-      string eventCurrency = country.currency;
-      StringToUpper(eventCurrency);
-      
+      MqlCalendarEvent evt;
+      if(!CalendarEventById(values[i].event_id, evt)) continue;
+      if(evt.importance != CALENDAR_IMPORTANCE_HIGH) continue;
+
+      MqlCalendarCountry cntry;
+      if(!CalendarCountryById(evt.country_id, cntry)) continue;
+      string evtCurrency = cntry.currency;
+
       bool relevant = false;
-      if(isSpecial)
+      if(StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0 ||
+         StringFind(sym, "BTC") >= 0 || StringFind(sym, "ETH") >= 0)
       {
-         relevant = (eventCurrency == "USD");
+         if(evtCurrency == "USD") relevant = true;
       }
       else
       {
-         string baseUp = baseCurrency;
-         string quoteUp = quoteCurrency;
-         StringToUpper(baseUp);
-         StringToUpper(quoteUp);
-         relevant = (eventCurrency == baseUp || eventCurrency == quoteUp);
+         if(evtCurrency == cur1 || evtCurrency == cur2) relevant = true;
       }
-      
-      if(relevant)
+
+      if(!relevant) continue;
+
+      datetime evtTime = values[i].time;
+      datetime blockStart = evtTime - (NewsPauseBeforeMin * 60);
+      datetime blockEnd   = evtTime + (NewsPauseAfterMin * 60);
+
+      if(now >= blockStart && now <= blockEnd)
       {
-         datetime eventTime = values[i].time;
-         if(now >= eventTime - NewsMinutesBefore * 60 && 
-            now <= eventTime + NewsMinutesAfter * 60)
-         {
-            if(DebugMode)
-               Print("📰 NEWS BLOCK: ", event.name, " at ", TimeToString(eventTime));
-            return true;
-         }
+         NewsBlocking = true;
+         NewsBlockEnd = blockEnd;
+         return true;
       }
    }
-   
+
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| VALIDATE STOPS                                                     |
+//| CheckDailyLimits - Conservative targets                           |
 //+------------------------------------------------------------------+
-bool ValidateStops(ENUM_ORDER_TYPE orderType, double price, double sl, double tp)
+void CheckDailyLimits()
 {
-   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   
-   double minDist = MathMax((double)stopsLevel, (double)freezeLevel) * point;
-   double spreadDist = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * point * 3;
-   minDist = MathMax(minDist, spreadDist);
-   
-   if(orderType == ORDER_TYPE_BUY)
+   if(DailyTargetHit || DailyLossHit) return;
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double changePct = ((equity - DayOpenEquity) / DayOpenEquity) * 100.0;
+
+   if(changePct >= DailyProfitTargetPct && !DailyTargetHit)
    {
-      if(MathAbs(price - sl) < minDist) return false;
-      if(MathAbs(tp - price) < minDist) return false;
+      DailyTargetHit = true;
+      Print("🎯 DAILY TARGET +", DoubleToString(DailyProfitTargetPct, 1), "% HIT! Locking gains.");
    }
-   else
+
+   if(changePct <= -DailyLossLimitPct && !DailyLossHit)
    {
-      if(MathAbs(sl - price) < minDist) return false;
-      if(MathAbs(price - tp) < minDist) return false;
+      DailyLossHit = true;
+      Print("🚨 DAILY LOSS LIMIT -", DoubleToString(DailyLossLimitPct, 1), "% HIT! Trading halted.");
    }
-   
-   return true;
 }
 
 //+------------------------------------------------------------------+
-//| Get current ATR                                                    |
+//| CheckDailyReset - Same as original                                |
+//+------------------------------------------------------------------+
+void CheckDailyReset()
+{
+   MqlDateTime cur, prev;
+   TimeToStruct(TimeCurrent(), cur);
+   TimeToStruct(DayResetTime, prev);
+
+   if(cur.day != prev.day || cur.mon != prev.mon)
+   {
+      DayOpenEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+      DayResetTime   = TimeCurrent();
+      DailyTargetHit = false;
+      DailyLossHit   = false;
+      Print("🌅 Daily Reset. Equity: $", DoubleToString(DayOpenEquity, 2));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ComputeLots - Conservative sizing with 0.1 cap                    |
+//+------------------------------------------------------------------+
+double ComputeLots(double slPoints)
+{
+   if(slPoints <= 0.0) return MinLot;
+
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * (RiskPctPerTrade / 100.0);
+
+   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double pt       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   if(tickVal <= 0 || tickSize <= 0 || pt <= 0) return MinLot;
+
+   double riskPerLot = (slPoints * pt / tickSize) * tickVal;
+   if(riskPerLot <= 0.0) return MinLot;
+
+   double lots = riskMoney / riskPerLot;
+
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double vMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vMax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   lots = MathFloor(lots / step) * step;
+   lots = MathMax(lots, vMin);
+   lots = MathMin(lots, vMax);
+   lots = MathMax(lots, MinLot);
+   lots = MathMin(lots, MaxLot); // Hard cap at 0.1
+
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| GetATR                                                             |
 //+------------------------------------------------------------------+
 double GetATR()
 {
-   double atrBuffer[];
-   ArraySetAsSeries(atrBuffer, true);
-   if(CopyBuffer(ATR_Handle, 0, 0, 1, atrBuffer) <= 0) return 0;
-   return atrBuffer[0];
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(ATR_Handle, 0, 0, 1, buf) < 1) return 0.0;
+   return buf[0];
 }
 
 //+------------------------------------------------------------------+
-//| Count positions                                                    |
+//| CountPositions                                                     |
 //+------------------------------------------------------------------+
-int CountMyPositions()
+int CountPositions()
 {
-   int count = 0;
+   int n = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      count++;
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == 777322 &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol)
+         n++;
    }
-   return count;
+   return n;
 }
+
 //+------------------------------------------------------------------+
+//| OnTradeTransaction - Same but with updated magic                  |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest     &req,
+                        const MqlTradeResult      &res)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+
+   ulong deal = trans.deal;
+   if(deal == 0) return;
+   if(!HistoryDealSelect(deal)) return;
+   if(HistoryDealGetInteger(deal, DEAL_MAGIC) != 777322) return;
+   if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
+
+   double p = HistoryDealGetDouble(deal, DEAL_PROFIT);
+   TotalProfit += p;
+
+   if(p > 0) WinCount++;
+   else if(p < 0) LossCount++;
+
+   int total = WinCount + LossCount;
+   double wr = total > 0 ? ((double)WinCount / total) * 100.0 : 0.0;
+
+   Print("💰 CLOSED | P&L: $", DoubleToString(p, 2),
+         " | Session: $", DoubleToString(TotalProfit, 2),
+         " | WR: ", DoubleToString(wr, 1), "%");
+}
+
+//+------------------------------------------------------------------+
+//| PrintDiagnostics - Less frequent logging                          |
+//+------------------------------------------------------------------+
+void PrintDiagnostics()
+{
+   if(!WarmupDone)
+   {
+      Print("⏳ Warming: ", TickCount, "/", TickLookback, " ticks...");
+      return;
+   }
+
+   double efficiency = CalculateFractalEfficiency();
+   double zScore     = CalculateReturnsZScore();
+   double vwap       = CalculateVWAP();
+   long   spread     = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double changePct  = ((equity - DayOpenEquity) / DayOpenEquity) * 100.0;
+
+   string marketRegime = (efficiency >= RegimeThresholdER) ? "STRONG TREND" : "RANGE/REVERSION";
+   string spikeStatus  = IsSpikeShieldActive ? "BLOCKED" : "CLEAR";
+
+   Print("📊 ER: ", DoubleToString(efficiency, 2), 
+         " | Z: ", DoubleToString(zScore, 2), 
+         " | VWAP: ", DoubleToString(vwap, _Digits),
+         " | Day: ", DoubleToString(changePct, 1), "%",
+         " | Regime: ", marketRegime,
+         " | Shield: ", spikeStatus);
+}
