@@ -19,7 +19,11 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # Copy EA files
-COPY ["InstitutionalTickHybridNewsFilter.mq5", "/root/InstitutionalTickHybridNewsFilter.mq5"]
+COPY ["Tick_Reversion_Pro_NEWS_FILTER.mq5", "/root/Tick_Reversion_Pro_NEWS_FILTER.mq5"]
+COPY ["Volatility_Breakout_Pro_News_Filter.mq5", "/root/Volatility_Breakout_Pro_News_Filter.mq5"]
+COPY ["test3.ex5", "/root/test3.ex5"]
+COPY ["test4.ex5", "/root/test4.ex5"]
+COPY ["test5.ex5", "/root/test5.ex5"]
 COPY ["test6.ex5", "/root/test6.ex5"]
 
 
@@ -60,7 +64,11 @@ fi
 
 mkdir -p "\$DATA_DIR/Experts"
 
-cp "/root/InstitutionalTickHybridNewsFilter.mq5" "\$DATA_DIR/Experts/"
+cp "/root/Tick_Reversion_Pro_NEWS_FILTER.mq5" "\$DATA_DIR/Experts/"
+cp "/root/Volatility_Breakout_Pro_News_Filter.mq5" "\$DATA_DIR/Experts/"
+cp "/root/test3.ex5" "\$DATA_DIR/Experts/"
+cp "/root/test4.ex5" "\$DATA_DIR/Experts/"
+cp "/root/test5.ex5" "\$DATA_DIR/Experts/"
 cp "/root/test6.ex5" "\$DATA_DIR/Experts/"
 
 
